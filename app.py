@@ -3,7 +3,7 @@ RCM Redrafting & Design Review Tool — Multi-Provider (Groq + Gemini)
 Run with: streamlit run rcm_tool_multi_provider.py
 
 Install dependencies:
-    pip install streamlit pandas openpyxl groq pydantic reportlab python-docx google-generativeai
+    pip install streamlit pandas openpyxl groq pydantic reportlab python-docx google-genai
 """
 
 import io
@@ -403,26 +403,29 @@ def _groq_review(client, model, prompt, max_retries, retry_delay) -> str:
 
 
 # ── Gemini ──────────────────────────────────────────────────────────────────
+# Uses the NEW google-genai SDK: pip install google-genai
+# NOT the old google-generativeai package (deprecated, broken for Gemini 2.x)
+
 def _gemini_redraft(client, model_name, prompt, max_retries, retry_delay) -> RCMBatchResponse:
-    import google.generativeai as genai
-    model = genai.GenerativeModel(
-        model_name=model_name,
-        system_instruction=SYSTEM_PROMPT_REDRAFT,
-        generation_config=genai.GenerationConfig(
-            temperature=0.2,
-            response_mime_type="application/json",
-        ),
-    )
+    # client is a google.genai.Client instance, already initialised with api_key
+    full_prompt = SYSTEM_PROMPT_REDRAFT + "\n\n" + prompt
     last_err = None
     for attempt in range(1, max_retries + 1):
         try:
-            resp = model.generate_content(prompt)
-            raw  = resp.text.strip()
+            resp = client.models.generate_content(
+                model=model_name,
+                contents=full_prompt,
+                config={
+                    "temperature": 0.2,
+                    "response_mime_type": "application/json",
+                },
+            )
+            raw = resp.text.strip()
             return RCMBatchResponse.model_validate(json.loads(_clean_json(raw)))
         except Exception as e:
             last_err = e
             err = str(e).lower()
-            if "429" in str(e) or "quota" in err or "rate" in err:
+            if "429" in str(e) or "quota" in err or "rate" in err or "resource_exhausted" in err:
                 wait = retry_delay * attempt
                 st.warning(f"⏳ Gemini rate limit (attempt {attempt}/{max_retries}). Waiting {wait}s…")
                 time.sleep(wait)
@@ -432,21 +435,22 @@ def _gemini_redraft(client, model_name, prompt, max_retries, retry_delay) -> RCM
 
 
 def _gemini_review(client, model_name, prompt, max_retries, retry_delay) -> str:
-    import google.generativeai as genai
-    model = genai.GenerativeModel(
-        model_name=model_name,
-        system_instruction=SYSTEM_PROMPT_REVIEW,
-        generation_config=genai.GenerationConfig(temperature=0.3),
-    )
+    full_prompt = SYSTEM_PROMPT_REVIEW + "\n\n" + prompt
     last_err = None
     for attempt in range(1, max_retries + 1):
         try:
-            resp = model.generate_content(prompt)
+            resp = client.models.generate_content(
+                model=model_name,
+                contents=full_prompt,
+                config={
+                    "temperature": 0.3,
+                },
+            )
             return resp.text.strip()
         except Exception as e:
             last_err = e
             err = str(e).lower()
-            if "429" in str(e) or "quota" in err or "rate" in err:
+            if "429" in str(e) or "quota" in err or "rate" in err or "resource_exhausted" in err:
                 wait = retry_delay * attempt
                 st.warning(f"⏳ Gemini rate limit (attempt {attempt}/{max_retries}). Waiting {wait}s…")
                 time.sleep(wait)
@@ -478,9 +482,15 @@ def get_client(provider, api_key):
         from groq import Groq
         return Groq(api_key=api_key)
     else:
-        import google.generativeai as genai
-        genai.configure(api_key=api_key)
-        return genai  # module itself acts as the configured client
+        # New google-genai SDK — pip install google-genai
+        try:
+            from google import genai
+        except ImportError:
+            raise ImportError(
+                "google-genai package not found. "
+                "Run: pip install google-genai"
+            )
+        return genai.Client(api_key=api_key)
 
 
 def test_api_key(provider, api_key) -> bool:
@@ -494,12 +504,33 @@ def test_api_key(provider, api_key) -> bool:
                 max_tokens=5,
             )
         else:
-            import google.generativeai as genai
-            genai.configure(api_key=api_key)
-            m = genai.GenerativeModel("gemini-2.0-flash-lite")
-            m.generate_content("hi")
+            try:
+                from google import genai
+            except ImportError:
+                st.error(
+                    "❌ google-genai package not installed. "
+                    "Run: pip install google-genai"
+                )
+                return False
+            client = genai.Client(api_key=api_key)
+            # Use a minimal prompt to verify the key works
+            client.models.generate_content(
+                model="gemini-2.0-flash-lite",
+                contents="hi",
+            )
         return True
-    except Exception:
+    except Exception as e:
+        err = str(e).lower()
+        # Surface the real reason in the UI instead of a generic "invalid key"
+        if "api_key" in err or "api key" in err or "invalid" in err or "unauthenticated" in err:
+            st.error(f"❌ Gemini API key rejected: {e}")
+        elif "not found" in err or "404" in err:
+            st.error(f"❌ Model not found — check your Gemini model name: {e}")
+        elif "quota" in err or "429" in err or "resource_exhausted" in err:
+            st.warning(f"⚠️ Gemini quota exceeded (key is valid but rate-limited): {e}")
+            return True   # key IS valid, just rate-limited
+        else:
+            st.error(f"❌ Gemini connection error: {e}")
         return False
 
 
